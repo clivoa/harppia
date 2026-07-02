@@ -1,0 +1,49 @@
+name: Compile Reports
+
+on:
+  schedule:
+    # Runs at XX:55 every 6h — after all 4 scanners (00, 15, 30, 45 min) have finished
+    - cron: "55 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Pull latest scanner results
+        run: git pull --rebase origin main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile categorized reports
+        run: python compile.py
+
+      - name: Commit and push reports
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add reports/
+            git commit -m "chore(reports): compile $(date -u +'%Y-%m-%d') findings"
+            git pull --rebase origin main
+            git push
+          else
+            echo "No new findings to compile"
+          fi

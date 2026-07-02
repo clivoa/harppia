@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Local ad-hoc scanner output
+local-results/
+findings*.json
+secrets.json
+*candidates*.json
