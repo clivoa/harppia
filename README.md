@@ -10,6 +10,8 @@ Harppia scans four surfaces (SwaggerHub API specs, GitHub code search, public Gi
 
 Findings are categorized by signal strength. Only high-confidence credentials trigger a Telegram alert — noisier categories (bearer tokens, JWTs, IP addresses) are logged to CSV for offline review.
 
+Matched secret values are redacted by default in terminal output, JSON/CSV exports, reports, and Telegram alerts. Each redacted finding includes `matched_value_hash` so you can correlate repeat values without exposing the raw secret.
+
 ---
 
 ## Responsible use
@@ -25,9 +27,9 @@ This tool is provided for defensive security and authorized OSINT workflows. You
 ```bash
 git clone https://github.com/clivoa/harppia.git
 cd harppia
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
-python harppia.py -k target-name -k target-domain.example
+python3 harppia.py -k target-name -k target-domain.example
 ```
 
 No configuration required for a first run. Add `--gh-pat` to unlock GitHub search and gist scanning at higher rate limits.
@@ -41,6 +43,9 @@ harppia/
 ├── harppia.py                     ← ad-hoc CLI entry point
 ├── compile.py                     ← aggregates daily findings into CSV reports
 ├── requirements.txt               ← requests only
+├── .env.example                   ← optional environment variable reference
+├── SECURITY.md                    ← security and responsible disclosure notes
+├── CONTRIBUTING.md                ← development and PR guidance
 ├── seen_hashes.json               ← deduplication state (committed by CI)
 ├── scanners/
 │   ├── swaggerhub.py              ← SwaggerHub scanner
@@ -50,14 +55,18 @@ harppia/
 ├── utils/
 │   ├── keywords.py                ← keyword list to scan for
 │   ├── patterns.py                ← 68 detection regexes + category mapping
+│   ├── keyword_match.py           ← boundary-aware keyword matching
+│   ├── redaction.py               ← matched-value redaction helpers
 │   ├── telegram.py                ← Telegram alert helper
 │   └── deduplication.py           ← SHA256-based cross-run dedup
+├── tests/                         ← unit tests for matching, redaction, dedup, reports
 └── .github/workflows/
     ├── swaggerhub-scanner.yml     ← cron :00
     ├── gist-scanner.yml           ← cron :15
     ├── github-search-scanner.yml  ← cron :30
     ├── formatter-scanner.yml      ← cron :45
-    └── compile-reports.yml        ← cron :55
+    ├── compile-reports.yml        ← cron :55
+    └── quality.yml                ← compile + unit tests on push/PR
 ```
 
 ---
@@ -66,42 +75,47 @@ harppia/
 
 The `harppia.py` CLI lets you scan on demand — no GitHub account, no secrets, no commits needed.
 
+Keyword confirmation is boundary-aware: short terms match token-like occurrences but not unrelated substrings inside longer alphanumeric words. Domain keywords also avoid matching inside longer domains.
+
 ### Basic usage
 
 ```bash
 # Scan across all four sources
-python harppia.py -k target-name -k target-domain.example
+python3 harppia.py -k target-name -k target-domain.example
 
 # Target specific scanners
-python harppia.py -k target-name --scanner swaggerhub,gists
+python3 harppia.py -k target-name --scanner swaggerhub,gists
 
 # Save to file
-python harppia.py -k target-name --output findings.json
-python harppia.py -k target-name --output findings.csv --format csv
+python3 harppia.py -k target-name --output findings.json
+python3 harppia.py -k target-name --output findings.csv --format csv
 
 # Save only high-confidence secrets
-python harppia.py -k target-name --category credential --output secrets.json
+python3 harppia.py -k target-name --category credential --output secrets.json
+
+# Reveal full matched values for controlled local triage
+python3 harppia.py -k target-name --category credential --show-secrets
 
 # Save SwaggerHub URLs discovered during the scan
-python harppia.py -k target-name --scanner swaggerhub --candidates-output swaggerhub-candidates.json
+python3 harppia.py -k target-name --scanner swaggerhub --candidates-output swaggerhub-candidates.json
 
 # Ignore previously seen findings (fresh scan)
-python harppia.py -k target-name --no-dedup
+python3 harppia.py -k target-name --no-dedup
 
 # Suppress Telegram alerts for this run
-python harppia.py -k target-name --no-alert
+python3 harppia.py -k target-name --no-alert
 
 # Pass credentials inline — no env vars needed
-python harppia.py -k target-name \
+python3 harppia.py -k target-name \
   --gh-pat ghp_xxxxxxxxxxxx \
   --telegram-token 123456789:ABCdef \
   --telegram-chat -1001234567890
 
 # Extend the GitHub Code Search time window
-python harppia.py -k target-name --since-hours 72
+python3 harppia.py -k target-name --since-hours 72
 
 # Skip the Gist public timeline pass (keyword search only, faster)
-python harppia.py -k target-name --gist-hours 0
+python3 harppia.py -k target-name --gist-hours 0
 ```
 
 ### Help output
@@ -109,8 +123,8 @@ python harppia.py -k target-name --gist-hours 0
 ```text
 usage: harppia [-h] [-k KEYWORD] [-s SCANNER] [-o FILE] [--candidates-output FILE]
                [--format {json,csv}] [--category CATEGORY] [--no-dedup] [--no-alert]
-               [--gh-pat TOKEN] [--telegram-token TOKEN] [--telegram-chat CHAT_ID]
-               [--since-hours N] [--gist-hours N]
+               [--show-secrets] [--gh-pat TOKEN] [--telegram-token TOKEN]
+               [--telegram-chat CHAT_ID] [--since-hours N] [--gist-hours N]
 
 Ad-hoc OSINT credential scanner — no GitHub Actions required.
 
@@ -131,6 +145,7 @@ optional arguments:
                         infrastructure. Comma-separated or repeat the flag.
   --no-dedup            Disable cross-run deduplication — scan everything fresh.
   --no-alert            Suppress Telegram alerts for this run.
+  --show-secrets        Print and save full matched secret values. Default: redact matched values.
   --gh-pat TOKEN        GitHub PAT (overrides GH_PAT env var).
   --telegram-token TOKEN
                         Telegram bot token (overrides TELEGRAM_BOT_TOKEN env var).
@@ -144,10 +159,10 @@ optional arguments:
 scanners: swaggerhub, github, gists, formatters, all (default: all)
 
 examples:
-  python harppia.py -k target-name -k target-domain.example
-  python harppia.py -k target-name --scanner swaggerhub,gists
-  python harppia.py -k target-name --no-dedup --output findings.json
-  python harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
+  python3 harppia.py -k target-name -k target-domain.example
+  python3 harppia.py -k target-name --scanner swaggerhub,gists
+  python3 harppia.py -k target-name --no-dedup --output findings.json
+  python3 harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
 ```
 
 ### All options
@@ -162,6 +177,7 @@ examples:
 | `--category` | all | Only print/save findings from one or more categories: `credential`, `token`, `pii`, `infrastructure`. Comma-separated or repeated. |
 | `--no-dedup` | off | Skip cross-run deduplication — scan everything fresh. |
 | `--no-alert` | off | Suppress Telegram alerts for this run. |
+| `--show-secrets` | off | Print and save full matched secret values. By default, `matched_value` is redacted and `matched_value_hash` is added for correlation. |
 | `--gh-pat` | `$GH_PAT` | GitHub Personal Access Token. |
 | `--telegram-token` | `$TELEGRAM_BOT_TOKEN` | Telegram bot token. |
 | `--telegram-chat` | `$TELEGRAM_CHAT_ID` | Telegram chat/channel ID. |
@@ -173,6 +189,8 @@ examples:
 ## Automated scanning with GitHub Actions
 
 For continuous monitoring, fork this repo and configure it to run on a schedule. Each scanner runs every 6 hours at a staggered offset to avoid simultaneous API pressure. Findings are committed back to the repo automatically; a 5th workflow compiles daily CSV reports.
+
+Scanner workflows share a single `harppia-writes` concurrency group so scheduled/manual runs do not push to the repository at the same time. A separate `quality.yml` workflow compiles the code and runs unit tests on pushes, pull requests, and manual dispatch.
 
 ### 1. Fork this repository
 
@@ -231,6 +249,8 @@ Go to your repository → **Settings → Secrets and variables → Actions → N
 | `TELEGRAM_CHAT_ID` | Channel/chat ID |
 | `GH_PAT` | GitHub PAT from step 4 |
 
+See `.env.example` for the same variables when running locally. Harppia reads environment variables directly; export them in your shell or pass CLI flags such as `--gh-pat`, `--telegram-token`, and `--telegram-chat`.
+
 ### 6. Enable GitHub Actions
 
 Go to the **Actions** tab in your repository and click **Enable workflows** if prompted.
@@ -246,6 +266,7 @@ Each workflow runs automatically at its scheduled time. You can also trigger any
 | `github-search-scanner.yml` | `:30` every 6h | GitHub Code Search |
 | `formatter-scanner.yml` | `:45` every 6h | Formatter paste sites |
 | `compile-reports.yml` | `:55` every 6h | Report aggregation |
+| `quality.yml` | push / PR / manual | Syntax + unit tests |
 
 ---
 
@@ -281,11 +302,14 @@ When using the CLI (`harppia.py`), findings are printed to the terminal. Use `--
   "keyword": "target-name",
   "url": "https://app.swaggerhub.com/apis/...",
   "pattern_name": "generic_api_key",
-  "matched_value": "api_key=example-value",
+  "matched_value": "api_...alue (21 chars)",
+  "matched_value_hash": "c38f4f6a16...",
   "category": "credential",
   "timestamp": "2026-07-02T12:00:00+00:00"
 }
 ```
+
+`matched_value` is redacted by default in terminal output, saved JSON/CSV, reports, and Telegram alerts. Use `--show-secrets` only for controlled local triage when the exact leaked value is required. When running an individual scanner module directly, set `HARPPIA_SHOW_SECRETS=1` only if you intentionally want raw values written to disk.
 
 ### Categories
 
@@ -331,11 +355,11 @@ If the two dicts fall out of sync, an `AssertionError` is raised immediately on 
 
 ## Deduplication
 
-Each finding is hashed as `SHA256(source | normalized_url | pattern_name)` and stored in `seen_hashes.json`. Subsequent runs skip any hash already present — the same secret in the same file will not be re-alerted.
+Each finding is hashed as `SHA256(source | normalized_url | pattern_name | matched_value)` and stored in `seen_hashes.json`. Subsequent runs skip any hash already present — the same secret in the same file will not be re-alerted, while a new value of the same pattern can still be detected.
 
 GitHub raw URLs are normalized (commit SHA stripped) so the same file across different commits maps to the same hash.
 
-SwaggerHub specs and Gist files that have been fully scanned are also marked with a `__SCANNED__` sentinel, so they are skipped entirely on the next run without re-fetching the content.
+Mutable sources such as SwaggerHub specs and Gist files are revisited on later runs so newly added secrets are not missed. Deduplication suppresses repeat alerts for values already seen.
 
 The CLI (`harppia.py`) participates in the same deduplication by default. Pass `--no-dedup` for a fresh scan that ignores history.
 
@@ -352,7 +376,20 @@ The CLI (`harppia.py`) participates in the same deduplication by default. Pass `
 The scanners include `time.sleep()` calls between requests to stay within these limits. If you add many keywords:
 - Reduce `TIMELINE_PAGES` in `scanners/github_gist.py` to scan fewer gist timeline pages.
 - Reduce `EXTENSIONS` in `scanners/github_search.py` to search fewer file types per keyword.
-- SwaggerHub is capped to the top 100 results per keyword (`MAX_PAGES = 1`) — already optimized.
+- SwaggerHub requests the top 100 `BEST_MATCH` specs per keyword.
+
+---
+
+## Development
+
+Run the same checks used by the quality workflow:
+
+```bash
+python3 -m py_compile harppia.py compile.py scanners/*.py utils/*.py tests/*.py
+python3 -m unittest discover -s tests
+```
+
+Tests cover redaction, deduplication, report loading, GitHub Search URL/content handling, and boundary-aware keyword matching.
 
 ---
 

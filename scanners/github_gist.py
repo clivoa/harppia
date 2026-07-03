@@ -11,9 +11,11 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.deduplication import is_seen, is_url_scanned, mark_seen, mark_url_scanned, save as save_hashes
+from utils.deduplication import is_seen, mark_seen, save as save_hashes
+from utils.keyword_match import find_keyword
 from utils.keywords import KEYWORDS
 from utils.patterns import scan_text
+from utils.redaction import reveal_secrets, sanitize_findings
 from utils.telegram import send_alert
 
 OUTPUT_DIR = Path("data/github_gists")
@@ -33,15 +35,12 @@ def _headers() -> dict:
     return h
 
 
-def _contains_keyword(text: str, keywords: list[str]) -> str | None:
-    text_lower = text.lower()
-    for kw in keywords:
-        if kw in text_lower:
-            return kw
-    return None
-
-
-def _scan_gist(gist: dict, keywords: list[str], use_dedup: bool) -> list[dict]:
+def _scan_gist(
+    gist: dict,
+    keywords: list[str],
+    use_dedup: bool,
+    scanned_urls_in_run: set[str],
+) -> list[dict]:
     findings = []
     gist_id = gist.get("id", "")
     gist_url = gist.get("html_url", "")
@@ -51,10 +50,11 @@ def _scan_gist(gist: dict, keywords: list[str], use_dedup: bool) -> list[dict]:
         if not raw_url:
             continue
 
-        kw = _contains_keyword(filename, keywords) or _contains_keyword(gist.get("description", "") or "", keywords)
+        kw = find_keyword(filename, keywords) or find_keyword(gist.get("description", "") or "", keywords)
 
-        if use_dedup and is_url_scanned("github_gist", raw_url):
+        if raw_url in scanned_urls_in_run:
             continue
+        scanned_urls_in_run.add(raw_url)
 
         try:
             resp = requests.get(raw_url, headers=_headers(), timeout=30)
@@ -66,20 +66,18 @@ def _scan_gist(gist: dict, keywords: list[str], use_dedup: bool) -> list[dict]:
             print(f"[GistScanner] Error fetching {raw_url}: {e}")
             continue
 
-        if use_dedup:
-            mark_url_scanned("github_gist", raw_url)
-
         if kw is None:
-            kw = _contains_keyword(content, keywords)
+            kw = find_keyword(content, keywords)
         if kw is None:
             continue
 
         for hit in scan_text(content):
             pattern_name = hit["pattern_name"]
-            if use_dedup and is_seen("github_gist", raw_url, pattern_name):
+            matched_value = hit.get("matched_value", "")
+            if use_dedup and is_seen("github_gist", raw_url, pattern_name, matched_value):
                 continue
             if use_dedup:
-                mark_seen("github_gist", raw_url, pattern_name)
+                mark_seen("github_gist", raw_url, pattern_name, matched_value)
             findings.append(
                 {
                     "source": "github_gist",
@@ -98,6 +96,7 @@ def _scan_gist(gist: dict, keywords: list[str], use_dedup: bool) -> list[dict]:
 
 def _timeline(keywords: list[str], use_dedup: bool, hours: int) -> list[dict]:
     all_findings: list[dict] = []
+    scanned_urls_in_run: set[str] = set()
     since_iso = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"[GistScanner] Timeline window: since {since_iso}")
 
@@ -124,7 +123,7 @@ def _timeline(keywords: list[str], use_dedup: bool, hours: int) -> list[dict]:
 
         print(f"[GistScanner] Page {page}: {len(gists)} gists")
         for gist in gists:
-            findings = _scan_gist(gist, keywords, use_dedup)
+            findings = _scan_gist(gist, keywords, use_dedup, scanned_urls_in_run)
             for f in findings:
                 send_alert(f)
                 print(f"[GistScanner] MATCH: {f['pattern_name']} in gist {f['gist_id']}")
@@ -179,10 +178,11 @@ def _keyword_search(keywords: list[str], use_dedup: bool) -> list[dict]:
 
             for hit in scan_text(content):
                 pattern_name = hit["pattern_name"]
-                if use_dedup and is_seen("github_gist", raw_url, pattern_name):
+                matched_value = hit.get("matched_value", "")
+                if use_dedup and is_seen("github_gist", raw_url, pattern_name, matched_value):
                     continue
                 if use_dedup:
-                    mark_seen("github_gist", raw_url, pattern_name)
+                    mark_seen("github_gist", raw_url, pattern_name, matched_value)
                 finding = {
                     "source": "github_gist",
                     "keyword": keyword,
@@ -234,7 +234,11 @@ def main() -> None:
             except Exception:
                 pass
         matches_path.write_text(
-            json.dumps(existing + all_matches, indent=2, ensure_ascii=False)
+            json.dumps(
+                sanitize_findings(existing + all_matches, reveal=reveal_secrets()),
+                indent=2,
+                ensure_ascii=False,
+            )
         )
     print(f"[GistScanner] Done. {len(all_matches)} new findings.")
 

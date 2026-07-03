@@ -11,8 +11,10 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.deduplication import is_seen, mark_seen, save as save_hashes
+from utils.keyword_match import find_keyword
 from utils.keywords import KEYWORDS
 from utils.patterns import scan_text
+from utils.redaction import reveal_secrets, sanitize_findings
 from utils.telegram import send_alert
 
 OUTPUT_DIR = Path("data")
@@ -111,7 +113,6 @@ def _fetch_and_parse(url: str) -> list:
 
 def scan(keywords: list[str], use_dedup: bool = True) -> list[dict]:
     """Scan formatter paste sites for credentials. Core logic shared by main() and the CLI."""
-    kw_lower = [kw.lower() for kw in keywords]
     all_findings: list[dict] = []
 
     for idx, endpoint_url in enumerate(ENDPOINTS, start=1):
@@ -122,7 +123,7 @@ def scan(keywords: list[str], use_dedup: bool = True) -> list[dict]:
         for raw_item in raw_items:
             rec = _normalize(raw_item, source=endpoint_url)
             text = " ".join(str(x) for x in [rec.get("title"), rec.get("url"), rec.get("id")] if x)
-            matched_kw = next((kw for kw in kw_lower if kw in text.lower()), None)
+            matched_kw = find_keyword(text, keywords)
             if matched_kw is None:
                 continue
 
@@ -139,10 +140,11 @@ def scan(keywords: list[str], use_dedup: bool = True) -> list[dict]:
 
             for hit in scan_text(resp.text):
                 pattern_name = hit["pattern_name"]
-                if use_dedup and is_seen("formatters", content_url, pattern_name):
+                matched_value = hit.get("matched_value", "")
+                if use_dedup and is_seen("formatters", content_url, pattern_name, matched_value):
                     continue
                 if use_dedup:
-                    mark_seen("formatters", content_url, pattern_name)
+                    mark_seen("formatters", content_url, pattern_name, matched_value)
                 finding = {
                     "source": "formatters",
                     "keyword": matched_kw,
@@ -175,7 +177,11 @@ def main() -> None:
             except Exception:
                 pass
         matches_path.write_text(
-            json.dumps(existing + all_findings, ensure_ascii=False, indent=2),
+            json.dumps(
+                sanitize_findings(existing + all_findings, reveal=reveal_secrets()),
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     print(f"[Formatters] Done. {len(all_findings)} credential findings.")

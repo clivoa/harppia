@@ -5,34 +5,49 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from utils.redaction import reveal_secrets, sanitize_findings
+
 DATA_DIR = Path("data")
 REPORTS_DIR = Path("reports")
-SOURCES = ["swaggerhub", "github_search", "github_gists", "formatters"]
 CATEGORIES = ["credential", "token", "pii", "infrastructure"]
 
-CSV_FIELDS = ["timestamp", "source", "keyword", "category", "pattern_name", "matched_value", "url"]
+CSV_FIELDS = [
+    "timestamp",
+    "source",
+    "keyword",
+    "category",
+    "pattern_name",
+    "matched_value",
+    "matched_value_hash",
+    "url",
+]
+
+
+def finding_paths(date: str) -> list[Path]:
+    return [
+        DATA_DIR / "swaggerhub" / f"{date}_matches.json",
+        DATA_DIR / "github_search" / f"{date}_matches.json",
+        DATA_DIR / "github_gists" / f"{date}_matches.json",
+        DATA_DIR / f"formatters_{date}_matches.json",
+    ]
 
 
 def load_findings(date: str) -> list[dict]:
     all_findings = []
-    for source in SOURCES:
-        candidates = [
-            DATA_DIR / source / f"{date}_matches.json",
-            DATA_DIR / f"formatters_{date}_matches.json",
-        ]
-        for path in candidates:
-            if not path.exists():
-                continue
-            try:
-                items = json.loads(path.read_text(encoding="utf-8"))
-                all_findings.extend(items)
-            except Exception as e:
-                print(f"[Compile] Could not read {path}: {e}")
+    for path in finding_paths(date):
+        if not path.exists():
+            continue
+        try:
+            items = json.loads(path.read_text(encoding="utf-8"))
+            all_findings.extend(items)
+        except Exception as e:
+            print(f"[Compile] Could not read {path}: {e}")
     return all_findings
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows = sanitize_findings(rows, reveal=reveal_secrets())
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()

@@ -2,12 +2,14 @@
 Keyword list for OSINT scanning.
 
 Add the organization names, brand identifiers, and domain fragments you want
-to monitor. Keywords are matched case-insensitively against file content,
-API spec titles, and gist descriptions across all scanners.
+to monitor. Keywords are matched case-insensitively with boundary-aware
+confirmation, so short terms do not match unrelated substrings inside longer
+alphanumeric words.
 
 Tips:
   - Prefer specific sub-brand names over generic words to reduce noise.
   - Domain fragments (e.g. "company.com") catch credentials in connection strings.
+  - Very short legacy names can be useful, but prefer longer aliases/domains when available.
   - Internal platform names (payment systems, CI tools, internal APIs) surface
     developer configs that brand names alone would miss.
   - Keep this list focused — every keyword multiplies GitHub API calls.

@@ -20,9 +20,9 @@ def _load() -> None:
     _loaded = True
 
 
-def _make_hash(source: str, url: str, pattern_name: str) -> str:
+def _make_hash(source: str, url: str, pattern_name: str, matched_value: object = "") -> str:
     normalized_url = _normalize_url(url)
-    key = f"{source}|{normalized_url}|{pattern_name}"
+    key = f"{source}|{normalized_url}|{pattern_name}|{matched_value}"
     return hashlib.sha256(key.encode()).hexdigest()
 
 
@@ -41,14 +41,14 @@ def _normalize_url(url: str) -> str:
     return url
 
 
-def is_seen(source: str, url: str, pattern_name: str) -> bool:
+def is_seen(source: str, url: str, pattern_name: str, matched_value: object = "") -> bool:
     _load()
-    return _make_hash(source, url, pattern_name) in _seen
+    return _make_hash(source, url, pattern_name, matched_value) in _seen
 
 
-def mark_seen(source: str, url: str, pattern_name: str) -> None:
+def mark_seen(source: str, url: str, pattern_name: str, matched_value: object = "") -> None:
     _load()
-    _seen.add(_make_hash(source, url, pattern_name))
+    _seen.add(_make_hash(source, url, pattern_name, matched_value))
 
 
 def is_url_scanned(source: str, url: str) -> bool:

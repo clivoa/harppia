@@ -5,11 +5,11 @@ harppia — ad-hoc OSINT credential scanner
 Scan public sources for leaked secrets without GitHub Actions.
 
 Examples:
-  python harppia.py -k target-name -k target-domain.example
-  python harppia.py -k target-name --scanner swaggerhub,github
-  python harppia.py -k target-name --output findings.json
-  python harppia.py -k target-name --no-dedup --no-alert
-  python harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
+  python3 harppia.py -k target-name -k target-domain.example
+  python3 harppia.py -k target-name --scanner swaggerhub,github
+  python3 harppia.py -k target-name --output findings.json
+  python3 harppia.py -k target-name --no-dedup --no-alert
+  python3 harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
 """
 import argparse
 import csv
@@ -18,6 +18,8 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from utils.redaction import sanitize_finding, sanitize_findings
 
 # ── ANSI colour codes (disabled automatically when not a TTY) ─────────────────
 _COLOUR = sys.stdout.isatty()
@@ -50,7 +52,8 @@ def _c(key: str, text: str) -> str:
 
 # ── Terminal output ────────────────────────────────────────────────────────────
 
-def _print_finding(f: dict) -> None:
+def _print_finding(f: dict, reveal: bool = False) -> None:
+    f = sanitize_finding(f, reveal=reveal)
     cat = f.get("category", "credential")
     label = _c(cat, _c("bold", cat.upper()))
     sep = _c("dim", "─" * 60)
@@ -90,20 +93,31 @@ def _print_summary(findings: list[dict]) -> None:
 
 # ── Output file ───────────────────────────────────────────────────────────────
 
-_CSV_FIELDS = ["timestamp", "source", "keyword", "category", "pattern_name", "matched_value", "url"]
+_CSV_FIELDS = [
+    "timestamp",
+    "source",
+    "keyword",
+    "category",
+    "pattern_name",
+    "matched_value",
+    "matched_value_hash",
+    "url",
+]
 _CATEGORIES = {"credential", "token", "pii", "infrastructure"}
+_SCANNERS = {"all", "swaggerhub", "github", "gists", "formatters"}
 
 
-def _save(findings: list[dict], path: str, fmt: str) -> None:
+def _save(findings: list[dict], path: str, fmt: str, reveal: bool = False) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    rows = sanitize_findings(findings, reveal=reveal)
     if fmt == "csv":
         with out.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=_CSV_FIELDS, extrasaction="ignore")
             w.writeheader()
-            w.writerows(findings)
+            w.writerows(rows)
     else:
-        out.write_text(json.dumps(findings, indent=2, ensure_ascii=False), encoding="utf-8")
+        out.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\n  Saved {len(findings)} finding(s) to {out}")
 
 
@@ -206,10 +220,10 @@ def _build_parser() -> argparse.ArgumentParser:
 scanners: swaggerhub, github, gists, formatters, all (default: all)
 
 examples:
-  python harppia.py -k target-name -k target-domain.example
-  python harppia.py -k target-name --scanner swaggerhub,gists
-  python harppia.py -k target-name --no-dedup --output findings.json
-  python harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
+  python3 harppia.py -k target-name -k target-domain.example
+  python3 harppia.py -k target-name --scanner swaggerhub,gists
+  python3 harppia.py -k target-name --no-dedup --output findings.json
+  python3 harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
         """,
     )
 
@@ -260,6 +274,11 @@ examples:
         help="Suppress Telegram alerts for this run.",
     )
     p.add_argument(
+        "--show-secrets",
+        action="store_true",
+        help="Print and save full matched secret values. Default: redact matched values.",
+    )
+    p.add_argument(
         "--gh-pat",
         metavar="TOKEN",
         default=os.environ.get("GH_PAT", ""),
@@ -300,6 +319,9 @@ def main() -> None:
     # Allow comma-separated scanners: --scanner swaggerhub,github
     if args.scanner:
         args.scanner = _expand_csv(args.scanner)
+    invalid_scanners = sorted(set(args.scanner or []) - _SCANNERS)
+    if invalid_scanners:
+        parser.error(f"invalid scanner: {', '.join(invalid_scanners)}")
     args.category = _expand_csv(args.category)
     invalid_categories = sorted(set(args.category) - _CATEGORIES)
     if invalid_categories:
@@ -309,12 +331,12 @@ def main() -> None:
     findings = _filter_findings(findings, args.category)
 
     for f in findings:
-        _print_finding(f)
+        _print_finding(f, reveal=args.show_secrets)
 
     _print_summary(findings)
 
     if args.output:
-        _save(findings, args.output, args.format)
+        _save(findings, args.output, args.format, reveal=args.show_secrets)
     if args.candidates_output:
         _save_candidates(candidates, args.candidates_output)
 

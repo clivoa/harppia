@@ -10,9 +10,11 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.deduplication import is_seen, is_url_scanned, mark_seen, mark_url_scanned, save as save_hashes
+from utils.deduplication import is_seen, mark_seen, save as save_hashes
+from utils.keyword_match import keyword_in_text
 from utils.keywords import KEYWORDS
 from utils.patterns import scan_text
+from utils.redaction import reveal_secrets, sanitize_findings
 from utils.telegram import send_alert
 
 OUTPUT_DIR = Path("data/swaggerhub")
@@ -110,10 +112,12 @@ def get_specs(keyword: str) -> list[dict]:
     return _parse_specs(data, keyword)
 
 
-def scan_spec(url: str) -> list[dict]:
+def scan_spec(url: str, keyword: str = "", keyword_confirmed: bool = False) -> list[dict]:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         if resp.status_code != 200:
+            return []
+        if keyword and not keyword_confirmed and not keyword_in_text(resp.text, keyword):
             return []
         return scan_text(resp.text)
     except Exception as e:
@@ -135,14 +139,15 @@ def _append_hits(
         if categories and hit.get("category") not in categories:
             continue
         pattern_name = hit["pattern_name"]
-        key = (dedup_url, pattern_name)
+        matched_value = hit.get("matched_value", "")
+        key = (dedup_url, pattern_name, matched_value)
         if key in seen_in_run:
             continue
         seen_in_run.add(key)
-        if use_dedup and is_seen("swaggerhub", dedup_url, pattern_name):
+        if use_dedup and is_seen("swaggerhub", dedup_url, pattern_name, matched_value):
             continue
         if use_dedup:
-            mark_seen("swaggerhub", dedup_url, pattern_name)
+            mark_seen("swaggerhub", dedup_url, pattern_name, matched_value)
         finding = {
             "source": "swaggerhub",
             "keyword": spec["keyword"],
@@ -161,6 +166,7 @@ def scan(keywords: list[str], use_dedup: bool = True, candidates=None, categorie
     """Scan SwaggerHub for credentials. Core logic shared by main() and the CLI."""
     all_matches: list[dict] = []
     seen_in_run: set[tuple] = set()
+    scanned_urls_in_run: set[str] = set()
 
     for keyword in keywords:
         print(f"[SwaggerHub] Scanning: {keyword}")
@@ -168,36 +174,51 @@ def scan(keywords: list[str], use_dedup: bool = True, candidates=None, categorie
         if candidates is not None:
             candidates.extend(_candidate_record(spec) for spec in all_specs)
 
-        new_specs = [
-            spec for spec in all_specs
-            if not (use_dedup and is_url_scanned("swaggerhub", spec["spec_url"]))
-        ]
+        new_specs = []
+        for spec in all_specs:
+            spec_url = spec["spec_url"]
+            if spec_url in scanned_urls_in_run:
+                continue
+            scanned_urls_in_run.add(spec_url)
+            new_specs.append(spec)
+
         skipped = len(all_specs) - len(new_specs)
         if skipped:
-            print(f"[SwaggerHub] {keyword}: skipping {skipped} already-scanned, {len(new_specs)} new")
+            print(f"[SwaggerHub] {keyword}: skipping {skipped} duplicate(s) in this run")
 
         if not new_specs:
             time.sleep(1)
             continue
 
+        metadata_matches: dict[str, bool] = {}
         for spec in new_specs:
+            metadata_matches[spec["spec_url"]] = keyword_in_text(
+                spec.get("metadata_text", ""),
+                spec["keyword"],
+            )
             _append_hits(
                 all_matches,
                 seen_in_run,
                 spec,
-                scan_text(spec.get("metadata_text", "")),
+                scan_text(spec.get("metadata_text", "")) if metadata_matches[spec["spec_url"]] else [],
                 "search_metadata",
                 use_dedup,
                 categories,
             )
 
         with ThreadPoolExecutor(max_workers=10) as ex:
-            future_to_spec = {ex.submit(scan_spec, spec["spec_url"]): spec for spec in new_specs}
+            future_to_spec = {
+                ex.submit(
+                    scan_spec,
+                    spec["spec_url"],
+                    spec["keyword"],
+                    metadata_matches.get(spec["spec_url"], False),
+                ): spec
+                for spec in new_specs
+            }
             for fut in as_completed(future_to_spec):
                 spec = future_to_spec[fut]
                 hits = fut.result()
-                if use_dedup:
-                    mark_url_scanned("swaggerhub", spec["spec_url"])
                 _append_hits(all_matches, seen_in_run, spec, hits, "spec", use_dedup, categories)
 
         time.sleep(1)
@@ -223,7 +244,11 @@ def main() -> None:
             except Exception:
                 pass
         matches_path.write_text(
-            json.dumps(existing + all_matches, indent=2, ensure_ascii=False)
+            json.dumps(
+                sanitize_findings(existing + all_matches, reveal=reveal_secrets()),
+                indent=2,
+                ensure_ascii=False,
+            )
         )
     print(f"[SwaggerHub] Done. {len(all_matches)} new findings.")
 
