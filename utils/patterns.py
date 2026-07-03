@@ -188,6 +188,85 @@ assert set(PATTERNS) == set(PATTERN_CATEGORY), (
     f"Mismatch: {set(PATTERNS) ^ set(PATTERN_CATEGORY)}"
 )
 
+# ── False-positive filters ────────────────────────────────────────────────────
+
+_BEARER_PLACEHOLDER = re.compile(r'^[Xx\-]{10,}$')
+
+_BASIC_HAS_ENTROPY = re.compile(r'[0-9+/=]')  # real base64 always has these
+_BASIC_SCREAMING = re.compile(r'^[A-Z][A-Z0-9_]{9,}$')  # BASE_64_ENCODED etc.
+
+_EMAIL_BAD_DOMAIN = re.compile(
+    r'(?i)\b(example|test|domain|email|company|your|sample|foo|bar|acme|dummy|mail)\b'
+)
+_EMAIL_BAD_LOCAL = re.compile(
+    r'(?i)^(john\.doe|jane\.doe|user|email|test|sample|you|admin|name|your|noreply|no-reply)'
+)
+
+_PRIVATE_IP = re.compile(
+    r'^(?:'
+    r'127\.'                          # loopback
+    r'|10\.'                          # RFC 1918
+    r'|192\.168\.'                    # RFC 1918
+    r'|172\.(?:1[6-9]|2\d|3[01])\.'  # RFC 1918
+    r'|169\.254\.'                    # link-local
+    r'|0\.'                           # "this" network / reserved
+    r'|255\.'                         # broadcast
+    r')'
+)
+
+_CPF_UNIFORM = re.compile(r'^(\d)\1{10}$')  # 00000000000, 11111111111 …
+
+
+def _is_false_positive(name: str, value: str) -> bool:
+    """Return True if the match is a known false positive that should be dropped."""
+
+    if name == "authorization_bearer":
+        token = value.split(None, 1)[1] if ' ' in value else value
+        if _BEARER_PLACEHOLDER.match(token):
+            return True
+
+    elif name == "authorization_basic":
+        token = value.split(None, 1)[1] if ' ' in value else value
+        if not _BASIC_HAS_ENTROPY.search(token):  # plain English word, no digits/base64
+            return True
+        if _BASIC_SCREAMING.match(token):          # SCREAMING_SNAKE placeholder
+            return True
+
+    elif name == "email":
+        local, _, domain = value.partition("@")
+        if _EMAIL_BAD_DOMAIN.search(domain):
+            return True
+        if _EMAIL_BAD_LOCAL.match(local):
+            return True
+        if re.match(r'^x+$', local, re.I):        # xxxxxxxx@xxx.xxx
+            return True
+        if len(local) <= 1:                        # 1@1.com
+            return True
+
+    elif name == "ip_address":
+        if _PRIVATE_IP.match(value):
+            return True
+        # All single-digit octets → version number (2.4.2.0) or docs IP (1.1.1.1)
+        if all(len(o) == 1 for o in value.split(".")):
+            return True
+
+    elif name in ("generic_api_key", "generic_secret_key", "possible_password"):
+        m = re.search(r'[=:]["\' `]*\s*(\S+)', value)
+        token = (m.group(1).strip("\"' `") if m else "").rstrip("\\n")
+        if re.match(r'(?i)^your[_\-A-Za-z]*$', token):   # YOUR_api_key
+            return True
+        if re.match(r'^[<\[{$%]', token):                 # <KEY>, ${VAR}, %VAR%
+            return True
+
+    elif name == "cpf":
+        digits = re.sub(r'\D', '', value)
+        if _CPF_UNIFORM.match(digits):          # 000…, 111… etc.
+            return True
+        if digits.startswith('123456789'):       # 123.456.789-XX
+            return True
+
+    return False
+
 
 def scan_text(text: str) -> list[dict]:
     """Return all pattern matches in text with category. Each dict: pattern_name, matched_value, category."""
@@ -199,6 +278,8 @@ def scan_text(text: str) -> list[dict]:
                 m = re.search(pattern, line)
                 if m:
                     value = m.group()
+                    if _is_false_positive(name, value):
+                        continue
                     key = (name, value[:40])
                     if key not in seen_in_run:
                         seen_in_run.add(key)
