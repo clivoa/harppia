@@ -6,7 +6,7 @@
 
 OSINT credential scanner — monitors public sources for leaked secrets matching your keywords.
 
-Harppia scans four surfaces (SwaggerHub API specs, GitHub code search, public Gists, and JSON/YAML formatter paste sites) looking for API keys, tokens, passwords, and other secrets associated with the organizations, brands, domains, or identifiers you define. It runs either **on demand from the command line** or **automatically via GitHub Actions** every 6 hours.
+Harppia scans seven surfaces — SwaggerHub API specs, GitHub code search, public Gists, JSON/YAML formatter paste sites, Sourcegraph (multi-platform code search), the npm registry, and optionally Pastebin — looking for API keys, tokens, passwords, and other secrets associated with the organizations, brands, domains, or identifiers you define. It runs either **on demand from the command line** or **automatically via GitHub Actions** on a schedule.
 
 Findings are categorized by signal strength. Only high-confidence credentials trigger a Telegram alert — noisier categories (bearer tokens, JWTs, IP addresses) are logged to CSV for offline review.
 
@@ -51,7 +51,10 @@ harppia/
 │   ├── swaggerhub.py              ← SwaggerHub scanner
 │   ├── github_search.py           ← GitHub Code Search scanner
 │   ├── github_gist.py             ← GitHub Gist scanner
-│   └── formatters.py              ← JSON/YAML formatter paste site scanner
+│   ├── formatters.py              ← JSON/YAML formatter paste site scanner
+│   ├── sourcegraph.py             ← Sourcegraph multi-platform code search
+│   ├── npm_registry.py            ← npm public package registry scanner
+│   └── pastebin.py                ← Pastebin scanner (ad-hoc only — see below)
 ├── utils/
 │   ├── keywords.py                ← keyword list to scan for
 │   ├── patterns.py                ← 68 detection regexes + category mapping
@@ -65,6 +68,8 @@ harppia/
     ├── gist-scanner.yml           ← cron :15
     ├── github-search-scanner.yml  ← cron :30
     ├── formatter-scanner.yml      ← cron :45
+    ├── sourcegraph-scanner.yml    ← cron every 12h
+    ├── npm-scanner.yml            ← cron daily
     ├── compile-reports.yml        ← cron :55
     └── quality.yml                ← compile + unit tests on push/PR
 ```
@@ -80,11 +85,12 @@ Keyword confirmation is boundary-aware: short terms match token-like occurrences
 ### Basic usage
 
 ```bash
-# Scan across all four sources
+# Scan across all sources (swaggerhub, github, gists, formatters, sourcegraph, npm)
 python3 harppia.py -k target-name -k target-domain.example
 
 # Target specific scanners
 python3 harppia.py -k target-name --scanner swaggerhub,gists
+python3 harppia.py -k target-name --scanner sourcegraph,npm
 
 # Save to file
 python3 harppia.py -k target-name --output findings.json
@@ -116,53 +122,9 @@ python3 harppia.py -k target-name --since-hours 72
 
 # Skip the Gist public timeline pass (keyword search only, faster)
 python3 harppia.py -k target-name --gist-hours 0
-```
 
-### Help output
-
-```text
-usage: harppia [-h] [-k KEYWORD] [-s SCANNER] [-o FILE] [--candidates-output FILE]
-               [--format {json,csv}] [--category CATEGORY] [--no-dedup] [--no-alert]
-               [--show-secrets] [--gh-pat TOKEN] [--telegram-token TOKEN]
-               [--telegram-chat CHAT_ID] [--since-hours N] [--gist-hours N]
-
-Ad-hoc OSINT credential scanner — no GitHub Actions required.
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -k KEYWORD, --keyword KEYWORD
-                        Keyword to scan (repeat for multiple). Defaults to utils/keywords.py if
-                        omitted.
-  -s SCANNER, --scanner SCANNER
-                        Scanners to run: swaggerhub, github, gists, formatters, all (default:
-                        all). Comma-separated or repeat the flag.
-  -o FILE, --output FILE
-                        Save findings to FILE (JSON by default, CSV with --format csv).
-  --candidates-output FILE
-                        Save discovered candidate URLs/metadata to FILE (SwaggerHub currently).
-  --format {json,csv}   Output file format (default: json).
-  --category CATEGORY   Only print/save findings from category: credential, token, pii,
-                        infrastructure. Comma-separated or repeat the flag.
-  --no-dedup            Disable cross-run deduplication — scan everything fresh.
-  --no-alert            Suppress Telegram alerts for this run.
-  --show-secrets        Print and save full matched secret values. Default: redact matched values.
-  --gh-pat TOKEN        GitHub PAT (overrides GH_PAT env var).
-  --telegram-token TOKEN
-                        Telegram bot token (overrides TELEGRAM_BOT_TOKEN env var).
-  --telegram-chat CHAT_ID
-                        Telegram chat/channel ID (overrides TELEGRAM_CHAT_ID env var).
-  --since-hours N       GitHub Code Search: look back N hours (default: 24). Use 0 for no time
-                        filter.
-  --gist-hours N        Gist timeline: scan gists updated in the last N hours (default: 6). Use 0
-                        to skip timeline.
-
-scanners: swaggerhub, github, gists, formatters, all (default: all)
-
-examples:
-  python3 harppia.py -k target-name -k target-domain.example
-  python3 harppia.py -k target-name --scanner swaggerhub,gists
-  python3 harppia.py -k target-name --no-dedup --output findings.json
-  python3 harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
+# Pastebin (requires Pro account + whitelisted IP — see below)
+python3 harppia.py -k target-name --scanner pastebin
 ```
 
 ### All options
@@ -170,7 +132,7 @@ examples:
 | Flag | Default | Description |
 |---|---|---|
 | `-k / --keyword` | `utils/keywords.py` | Keyword to scan. Repeat for multiple. Falls back to `utils/keywords.py` if omitted. |
-| `-s / --scanner` | `all` | Scanners to run: `swaggerhub`, `github`, `gists`, `formatters`, or `all`. Comma-separated or repeated. |
+| `-s / --scanner` | `all` | Scanners to run: `swaggerhub`, `github`, `gists`, `formatters`, `sourcegraph`, `npm`, or `all`. Use `pastebin` explicitly (see below). Comma-separated or repeated. |
 | `-o / --output` | — | Save findings to a file. |
 | `--candidates-output` | — | Save discovered candidate URLs/metadata to a JSON file (SwaggerHub currently). |
 | `--format` | `json` | Output file format: `json` or `csv`. |
@@ -186,11 +148,40 @@ examples:
 
 ---
 
+## Scanners
+
+| Scanner | `--scanner` | Automated | What it searches |
+|---|---|---|---|
+| SwaggerHub | `swaggerhub` | every 6h | Public API specs on SwaggerHub |
+| GitHub Code Search | `github` | every 6h | Source files in public GitHub repos |
+| GitHub Gists | `gists` | every 6h | Public Gists (timeline + keyword search) |
+| Formatter sites | `formatters` | every 6h | Recent pastes on jsonformatter.org (YAML/XML endpoints) |
+| Sourcegraph | `sourcegraph` | every 12h | Public code across GitHub, GitLab, Bitbucket, and more |
+| npm registry | `npm` | daily | Package metadata and READMEs on the npm public registry |
+| Pastebin | `pastebin` | ❌ ad-hoc only | Recent public pastes on Pastebin (see below) |
+
+### Pastebin
+
+The Pastebin scanner uses the [Pastebin Scraping API](https://pastebin.com/doc_scraping_api), which requires:
+
+1. A **Pastebin Pro account** (subscriber tier).
+2. Your runner's **IP address whitelisted** in your Pastebin account settings.
+
+Because of the IP whitelist requirement, the Pastebin scanner is intentionally **excluded from `--scanner all`** and from the automated GitHub Actions schedule (GitHub Actions uses dynamic IPs that cannot be reliably whitelisted). It is only available when invoked explicitly:
+
+```bash
+PASTEBIN_API_KEY=your_key python3 harppia.py -k target-name --scanner pastebin
+```
+
+To use it, whitelist the IP of the machine you are running it from at [pastebin.com/doc_scraping_api](https://pastebin.com/doc_scraping_api). If you run it from a server with a fixed IP, add that IP to the whitelist and set the `PASTEBIN_API_KEY` environment variable.
+
+---
+
 ## Automated scanning with GitHub Actions
 
-For continuous monitoring, fork this repo and configure it to run on a schedule. Each scanner runs every 6 hours at a staggered offset to avoid simultaneous API pressure. Findings are committed back to the repo automatically; a 5th workflow compiles daily CSV reports.
+For continuous monitoring, fork this repo and configure it to run on a schedule. Findings are committed back to the repo automatically; a separate workflow compiles daily CSV reports.
 
-Scanner workflows share a single `harppia-writes` concurrency group so scheduled/manual runs do not push to the repository at the same time. A separate `quality.yml` workflow compiles the code and runs unit tests on pushes, pull requests, and manual dispatch.
+Scanner workflows share a single `harppia-writes` concurrency group so scheduled runs do not push to the repository at the same time. A separate `quality.yml` workflow compiles the code and runs unit tests on pushes, pull requests, and manual dispatch.
 
 ### 1. Fork this repository
 
@@ -243,11 +234,12 @@ The GitHub Search and Gist scanners use a PAT to access the API at higher rate l
 
 Go to your repository → **Settings → Secrets and variables → Actions → New repository secret**.
 
-| Secret | Value |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | Channel/chat ID |
-| `GH_PAT` | GitHub PAT from step 4 |
+| Secret | Value | Required by |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | All scanners (alerts) |
+| `TELEGRAM_CHAT_ID` | Channel/chat ID | All scanners (alerts) |
+| `GH_PAT` | GitHub PAT from step 4 | GitHub Search, Gists |
+| `SOURCEGRAPH_TOKEN` | Sourcegraph access token (optional) | Sourcegraph (higher rate limits) |
 
 See `.env.example` for the same variables when running locally. Harppia reads environment variables directly; export them in your shell or pass CLI flags such as `--gh-pat`, `--telegram-token`, and `--telegram-chat`.
 
@@ -259,12 +251,14 @@ Each workflow runs automatically at its scheduled time. You can also trigger any
 
 ### Workflow schedule
 
-| Workflow | Cron | Scanner |
+| Workflow | Schedule | Scanner |
 |---|---|---|
 | `swaggerhub-scanner.yml` | `:00` every 6h | SwaggerHub |
 | `gist-scanner.yml` | `:15` every 6h | GitHub Gists |
 | `github-search-scanner.yml` | `:30` every 6h | GitHub Code Search |
 | `formatter-scanner.yml` | `:45` every 6h | Formatter paste sites |
+| `sourcegraph-scanner.yml` | `:15` every 12h | Sourcegraph |
+| `npm-scanner.yml` | `08:30` daily | npm registry |
 | `compile-reports.yml` | `:55` every 6h | Report aggregation |
 | `quality.yml` | push / PR / manual | Syntax + unit tests |
 
@@ -282,6 +276,12 @@ data/
     2026-07-02_matches.json
   github_gists/
     2026-07-02_matches.json
+  sourcegraph/
+    2026-07-02_matches.json
+  npm/
+    2026-07-02_matches.json
+  pastebin/
+    2026-07-02_matches.json        ← only present when run ad-hoc
   formatters_2026-07-02_matches.json
 reports/
   2026-07-02_credential.csv    ← Telegram alerts were sent for these rows
@@ -298,9 +298,11 @@ When using the CLI (`harppia.py`), findings are printed to the terminal. Use `--
 
 ```json
 {
-  "source": "swaggerhub",
+  "source": "sourcegraph",
   "keyword": "target-name",
-  "url": "https://app.swaggerhub.com/apis/...",
+  "url": "https://sourcegraph.com/github.com/user/repo/-/blob/config/app.yml",
+  "repository": "github.com/user/repo",
+  "path": "config/app.yml",
   "pattern_name": "generic_api_key",
   "matched_value": "api_...alue (21 chars)",
   "matched_value_hash": "c38f4f6a16...",
@@ -367,16 +369,21 @@ The CLI (`harppia.py`) participates in the same deduplication by default. Pass `
 
 ## Rate limits
 
-| API | Unauthenticated | Authenticated (PAT) |
+| Source | Unauthenticated | Authenticated |
 |---|---|---|
-| GitHub Code Search | 10 req/min | 30 req/min |
-| GitHub Gists timeline | 60 req/hour | 5,000 req/hour |
+| GitHub Code Search | 10 req/min | 30 req/min (with `GH_PAT`) |
+| GitHub Gists timeline | 60 req/hour | 5,000 req/hour (with `GH_PAT`) |
 | SwaggerHub | No auth required | — |
+| Sourcegraph | Free tier (limited) | Higher limits (with `SOURCEGRAPH_TOKEN`) |
+| npm registry | No auth required | — |
+| Pastebin Scraping API | IP whitelist required | Requires Pro account |
 
 The scanners include `time.sleep()` calls between requests to stay within these limits. If you add many keywords:
 - Reduce `TIMELINE_PAGES` in `scanners/github_gist.py` to scan fewer gist timeline pages.
 - Reduce `EXTENSIONS` in `scanners/github_search.py` to search fewer file types per keyword.
 - SwaggerHub requests the top 100 `BEST_MATCH` specs per keyword.
+- Sourcegraph is capped at 50 results per keyword by default (`_COUNT` in `scanners/sourcegraph.py`).
+- npm is capped at 50 full metadata fetches per keyword (`_MAX_FULL_FETCH` in `scanners/npm_registry.py`).
 
 ---
 
@@ -389,7 +396,7 @@ python3 -m py_compile harppia.py compile.py scanners/*.py utils/*.py tests/*.py
 python3 -m unittest discover -s tests
 ```
 
-Tests cover redaction, deduplication, report loading, GitHub Search URL/content handling, and boundary-aware keyword matching.
+Tests cover redaction, deduplication, report loading (all sources), GitHub Search URL/content handling, and boundary-aware keyword matching.
 
 ---
 

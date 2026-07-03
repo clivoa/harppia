@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """JSON/YAML formatter site scanner — scans recent paste links for credentials."""
+import ctypes
 import json
 import re
 import sys
@@ -18,15 +19,42 @@ from utils.redaction import reveal_secrets, sanitize_findings
 from utils.telegram import send_alert
 
 OUTPUT_DIR = Path("data")
-USER_AGENT = "Mozilla/5.0 (compatible; harppia/1.0)"
 
+# Full browser UA required — jsonformatter.org rejects bot-like strings
+_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+_JF_SECRET = "JF_SECURE_V4_8f3e2b9a"
+_CONTENT_API = "https://jsonformatter.org/service/getDataFromID"
+
+# /json is blocked by Cloudflare Managed Challenge; /yaml and /xml are accessible.
+# codebeautify.org also returns 403.
 ENDPOINTS = [
-    "https://jsonformatter.org/recentLinksPage/json",
     "https://jsonformatter.org/recentLinksPage/yaml",
     "https://jsonformatter.org/recentLinksPage/xml",
-    # codebeautify.org returns 403 — kept here for reference, skipped at runtime
-    "https://codebeautify.org/recentLinksPage",
 ]
+
+
+def _jf_hash(s: str) -> str:
+    """Reimplementation of the site's _sh() JS function (djb2-style, 32-bit)."""
+    t = 0
+    for c in s:
+        t = ctypes.c_int32((t << 5) - t + ord(c)).value
+    return format(ctypes.c_uint32(t).value, "x")
+
+
+def _jf_sig() -> str:
+    """Reimplementation of the site's _gs() JS function — rotates every 10 min."""
+    bucket = int(time.time() * 1000) // 600000
+    return _jf_hash(_JF_SECRET + _USER_AGENT + str(bucket))
+
+
+def _toolstype(url: str) -> str:
+    """Infer toolstype from the formatter page URL path."""
+    path = url.split("jsonformatter.org/", 1)[-1].split("/")[0] if "jsonformatter.org/" in url else ""
+    if "yaml" in path:
+        return "yaml"
+    if "xml" in path:
+        return "xml"
+    return "json"
 
 
 def _get_first(item: dict, *keys):
@@ -88,7 +116,7 @@ def _parse_html_items(html: str, source: str) -> list:
 def _fetch_and_parse(url: str) -> list:
     print(f"[Formatters] Fetching: {url}")
     try:
-        resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+        resp = requests.get(url, timeout=30, headers={"User-Agent": _USER_AGENT})
         resp.raise_for_status()
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response else "N/A"
@@ -111,6 +139,36 @@ def _fetch_and_parse(url: str) -> list:
     return items
 
 
+def _fetch_raw_content(hash_id: str, content_url: str) -> str:
+    """Fetch the raw paste content via the site's internal API."""
+    ttype = _toolstype(content_url)
+    try:
+        resp = requests.post(
+            _CONTENT_API,
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Referer": content_url,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            data=f"urlid={hash_id}&toolstype={ttype}&sig={_jf_sig()}",
+            timeout=20,
+        )
+        if resp.status_code == 429:
+            print("[Formatters] Rate limited on content API, sleeping 15s...")
+            time.sleep(15)
+            return ""
+        if not resp.ok:
+            return ""
+        data = resp.json()
+        if isinstance(data, dict):
+            return data.get("content", "")
+        return ""
+    except Exception as e:
+        print(f"[Formatters] Error fetching content {hash_id}: {e}")
+        return ""
+
+
 def scan(keywords: list[str], use_dedup: bool = True) -> list[dict]:
     """Scan formatter paste sites for credentials. Core logic shared by main() and the CLI."""
     all_findings: list[dict] = []
@@ -122,23 +180,21 @@ def scan(keywords: list[str], use_dedup: bool = True) -> list[dict]:
         raw_items = _fetch_and_parse(endpoint_url)
         for raw_item in raw_items:
             rec = _normalize(raw_item, source=endpoint_url)
-            text = " ".join(str(x) for x in [rec.get("title"), rec.get("url"), rec.get("id")] if x)
-            matched_kw = find_keyword(text, keywords)
+            hash_id = rec.get("id")
+            content_url = rec.get("url")
+            if not hash_id or not content_url:
+                continue
+
+            time.sleep(1)
+            content = _fetch_raw_content(hash_id, content_url)
+            if not content:
+                continue
+
+            matched_kw = find_keyword(content, keywords)
             if matched_kw is None:
                 continue
 
-            content_url = rec.get("url")
-            if not content_url:
-                continue
-
-            try:
-                resp = requests.get(content_url, timeout=20, headers={"User-Agent": USER_AGENT})
-                if not resp.ok:
-                    continue
-            except Exception:
-                continue
-
-            for hit in scan_text(resp.text):
+            for hit in scan_text(content):
                 pattern_name = hit["pattern_name"]
                 matched_value = hit.get("matched_value", "")
                 if use_dedup and is_seen("formatters", content_url, pattern_name, matched_value):

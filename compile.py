@@ -29,6 +29,9 @@ def finding_paths(date: str) -> list[Path]:
         DATA_DIR / "github_search" / f"{date}_matches.json",
         DATA_DIR / "github_gists" / f"{date}_matches.json",
         DATA_DIR / f"formatters_{date}_matches.json",
+        DATA_DIR / "sourcegraph" / f"{date}_matches.json",
+        DATA_DIR / "npm" / f"{date}_matches.json",
+        DATA_DIR / "pastebin" / f"{date}_matches.json",
     ]
 
 

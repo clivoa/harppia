@@ -104,7 +104,7 @@ _CSV_FIELDS = [
     "url",
 ]
 _CATEGORIES = {"credential", "token", "pii", "infrastructure"}
-_SCANNERS = {"all", "swaggerhub", "github", "gists", "formatters"}
+_SCANNERS = {"all", "swaggerhub", "github", "gists", "formatters", "sourcegraph", "npm", "pastebin"}
 
 
 def _save(findings: list[dict], path: str, fmt: str, reveal: bool = False) -> None:
@@ -206,6 +206,21 @@ def _run(args: argparse.Namespace) -> tuple[list[dict], list[dict]]:
         from scanners.formatters import scan as fmt_scan
         all_findings.extend(fmt_scan(keywords, use_dedup=use_dedup))
 
+    if run_all or "sourcegraph" in scanners:
+        from scanners.sourcegraph import scan as sg_scan
+        all_findings.extend(sg_scan(keywords, use_dedup=use_dedup))
+
+    if run_all or "npm" in scanners:
+        from scanners.npm_registry import scan as npm_scan
+        all_findings.extend(npm_scan(keywords, use_dedup=use_dedup))
+
+    # Pastebin requires a Pro account and IP whitelisting — not included in "all".
+    # See: https://pastebin.com/doc_scraping_api
+    # Run explicitly with: --scanner pastebin
+    if "pastebin" in scanners and not run_all:
+        from scanners.pastebin import scan as pb_scan
+        all_findings.extend(pb_scan(keywords, use_dedup=use_dedup))
+
     return all_findings, all_candidates
 
 
@@ -217,13 +232,16 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Ad-hoc OSINT credential scanner — no GitHub Actions required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-scanners: swaggerhub, github, gists, formatters, all (default: all)
+scanners: swaggerhub, github, gists, formatters, sourcegraph, npm, all (default: all)
+          pastebin  (explicit only — requires Pro account + IP whitelist)
 
 examples:
   python3 harppia.py -k target-name -k target-domain.example
   python3 harppia.py -k target-name --scanner swaggerhub,gists
+  python3 harppia.py -k target-name --scanner sourcegraph,npm
   python3 harppia.py -k target-name --no-dedup --output findings.json
   python3 harppia.py -k target-name --gh-pat ghp_xxx --since-hours 72
+  python3 harppia.py -k target-name --scanner pastebin  # needs Pro + IP whitelist
         """,
     )
 
@@ -237,7 +255,8 @@ examples:
         "-s", "--scanner",
         action="append",
         metavar="SCANNER",
-        help="Scanners to run: swaggerhub, github, gists, formatters, all (default: all). "
+        help="Scanners to run: swaggerhub, github, gists, formatters, sourcegraph, npm, all (default: all). "
+             "Use 'pastebin' explicitly (requires Pro account + IP whitelist). "
              "Comma-separated or repeat the flag.",
     )
     p.add_argument(
